@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = import-auth ]; then
+  install -m 0600 /dev/stdin /home/worker/.codex/auth.json
+  exit 0
+fi
+repository=$(python3 -c 'import json; print(json.load(open("/run/mac-agent/github/lease.json"))["repository"])' 2>/dev/null || true)
+if [ -n "$repository" ]; then
+  export MAC_AGENT_REPOSITORY="$repository"
+  git config --global credential.useHttpPath true
+  git config --global credential.helper /usr/local/bin/git-credential-mac-agent
+fi
+if [ "${1:-}" = resume ]; then
+  exec codex exec resume --last -C /workspace - < /run/mac-agent/brief.txt
+fi
+exec codex exec -C /workspace - < /run/mac-agent/brief.txt

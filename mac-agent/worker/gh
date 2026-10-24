@@ -1,0 +1,6 @@
+#!/bin/sh
+# Executes the real gh without recursively resolving this wrapper.
+set -eu
+real=/usr/bin/gh
+[ -x "$real" ] || real=/usr/local/bin/gh
+exec "$real" "$@"
