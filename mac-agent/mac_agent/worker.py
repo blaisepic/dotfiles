@@ -24,8 +24,9 @@ class DockerWorker:
     def start(self, task, lease_dir=None, resume=False):
         name = task['container_name']
         if resume:
-            result = self._run(['docker', 'start', name])
-            return {'container_id': self._owned(task).get('Id'), 'container_name': name, 'status': 'running'}
+            owned = self._owned(task)
+            self._run(['docker', 'start', name])
+            return {'container_id': owned.get('Id'), 'container_name': name, 'status': 'running'}
         args = ['docker', 'run', '-d', '--name', name, '--label', f"mac-agent.task_id={task['id']}",
                 '--label', 'mac-agent.managed=true', '--read-only', '--cap-drop=ALL',
                 '--security-opt=no-new-privileges:true', '--cpus', str(self.worker_config.get('cpus', '2')),

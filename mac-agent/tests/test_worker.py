@@ -67,10 +67,18 @@ class WorkerTests(unittest.TestCase):
 
     def test_resume_restarts_existing_container_instead_of_creating_name_again(self):
         with patch('mac_agent.worker.subprocess.run') as run:
-            run.side_effect = [type('R', (), {'stdout':'container-id\n'})(), type('R', (), {'stdout':json.dumps([{'Id':'cid','Config':{'Labels':{'mac-agent.task_id':self.task['id'],'mac-agent.managed':'true'}}}])})()]
+            run.side_effect = [type('R', (), {'stdout':json.dumps([{'Id':'cid','Config':{'Labels':{'mac-agent.task_id':self.task['id'],'mac-agent.managed':'true'}}}])})(), type('R', (), {'stdout':'container-id\n'})()]
             self.worker.start(self.task, resume=True)
-        args = run.call_args_list[0].args[0]
+        args = run.call_args_list[1].args[0]
         self.assertEqual(args, ['docker', 'start', self.task['container_name']])
+
+    def test_resume_checks_ownership_before_starting_any_container(self):
+        with patch('mac_agent.worker.subprocess.run') as run:
+            run.return_value.stdout = json.dumps([{'Config': {'Labels': {'mac-agent.task_id': 'other'}}}])
+            with self.assertRaises(PermissionError):
+                self.worker.start(self.task, resume=True)
+        self.assertEqual(run.call_args_list[0].args[0][1], 'inspect')
+        self.assertFalse(any(call.args[0][1] == 'start' for call in run.call_args_list))
 
     def test_import_auth_targets_codex_volume_and_correct_path(self):
         auth = self.root_path/'auth.json'; auth.write_text('{}')
