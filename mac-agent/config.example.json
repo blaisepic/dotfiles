@@ -1,0 +1,26 @@
+{
+  "state_dir": "~/.local/share/mac-agent",
+  "repositories": {
+    "dotfiles": {
+      "github": "blaisepic/dotfiles",
+      "source": "https://github.com/blaisepic/dotfiles.git",
+      "base_branch": "main",
+      "test_commands": [["python3", "-m", "unittest", "discover", "-s", "mac-agent/tests", "-v"]]
+    }
+  },
+  "worker": {
+    "image": "mac-agent-worker:0.1.0",
+    "codex_version": "0.163.0",
+    "model": null,
+    "cpus": "2",
+    "memory": "4g",
+    "pids_limit": 256,
+    "auth_volume": "mac-agent-codex-auth",
+    "agent": "codex"
+  },
+  "github_app": {
+    "app_id": "",
+    "installation_id": "",
+    "private_key_path": "~/.config/mac-agent/github-app.pem"
+  }
+}
