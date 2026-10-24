@@ -49,6 +49,15 @@ class TaskStorageTests(unittest.TestCase):
         self.assertEqual(os.stat(task['task_dir']).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(Path(task['task_dir']) / 'task.json').st_mode & 0o777, 0o600)
 
+    def test_brief_includes_exact_repository_tests_and_publication_policy(self):
+        task = create_task(self.config, 'fixture', 'Implement a feature', publish=True)
+        brief = Path(task['brief_path']).read_text()
+        self.assertIn('owner/repo', brief)
+        self.assertIn('["python3", "-m", "unittest"]', brief)
+        self.assertIn('gh pr create', brief)
+        self.assertIn('Never execute inherited installation scripts', brief)
+        self.assertIn('Do not print or read credential files', brief)
+
     def test_read_list_and_save_task_round_trip_without_changing_identity(self):
         task = create_task(self.config, 'fixture', 'Keep me safe')
         self.assertEqual(get_task(self.config, task['id']), task)

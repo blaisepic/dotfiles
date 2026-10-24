@@ -34,8 +34,12 @@ class DockerWorker:
                 '-v', f"{name}-home:/home/worker:rw",
                 '-v', f"{task['workspace']}:/workspace:rw", '-v',
                 f"{task['brief_path']}:/run/mac-agent/brief.txt:ro", '-v',
-                f"{self.worker_config.get('auth_volume', 'mac-agent-codex-auth')}:/home/worker/.codex:rw"]
+                f"{self.worker_config.get('auth_volume', 'mac-agent-codex-auth')}:/home/worker/.codex:rw",
+                '-v', f"{name}-sessions:/home/worker/.codex/sessions:rw",
+                '-e', 'CODEX_SQLITE_HOME=/home/worker/state']
         args += ['-e', f"MAC_AGENT_REPOSITORY={task['repository']}"]
+        if self.worker_config.get('model'):
+            args += ['-e', 'MAC_AGENT_MODEL=' + self.worker_config['model']]
         if lease_dir:
             args += ['-v', f'{lease_dir}:/run/mac-agent/github:ro']
         args += ['-w', '/workspace', self.worker_config.get('image', 'mac-agent-worker:0.1.0')]

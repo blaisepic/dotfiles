@@ -4,6 +4,8 @@ import base64
 import json
 import os
 import re
+import sys
+import fcntl
 import signal
 import subprocess
 import tempfile
@@ -20,8 +22,11 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 def _private_dir(path):
     path = Path(path).expanduser().absolute()
-    if path.exists() and path.is_symlink():
-        raise ValueError("unsafe symlink in state path")
+    for ancestor in (path, *path.parents):
+        if ancestor == Path("/") or ancestor == Path.home():
+            break
+        if ancestor.is_symlink():
+            raise ValueError("unsafe symlink in state path")
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     os.chmod(str(path), 0o700)
     return path
@@ -44,8 +49,8 @@ def _sign(app_id, key_path, now):
     return header + "." + payload + "." + base64.urlsafe_b64encode(proc.stdout).rstrip(b"=").decode()
 
 
-def _request(url, headers, body, timeout):
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+def _request(url, headers, body, timeout, method=None):
+    req = urllib.request.Request(url, data=body, headers=headers, method=method or ("POST" if body else "GET"))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status, response.read()
@@ -60,13 +65,23 @@ def mint_installation_token(app_config, repository, http_request=None, now=None,
     key = Path(app_config.get("private_key_path", "")).expanduser().absolute()
     if not str(app_id).isdigit() or not str(install_id).isdigit() or not key.is_absolute() or key.is_symlink():
         raise ValueError("invalid GitHub App configuration")
-    st = key.stat()
-    if st.st_mode & 0o077:
+    st = os.stat(str(key), follow_symlinks=False)
+    if st.st_mode & 0o077 or st.st_uid != os.getuid():
         raise PermissionError("GitHub App key must be private")
     now = time.time() if now is None else now
     jwt = (signer or _sign)(app_id, key, now)
     body = json.dumps({"repositories": [repository.split("/", 1)[1]], "permissions": {"contents": "write", "pull_requests": "write"}}, separators=(",", ":")).encode()
-    status, raw = (http_request or _request)(API + "/app/installations/" + str(install_id) + "/access_tokens", {"Accept": "application/vnd.github+json", "Authorization": "Bearer " + jwt, "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"}, body, 15)
+    request = http_request or _request
+    headers = {"Accept": "application/vnd.github+json", "Authorization": "Bearer " + jwt, "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"}
+    status, raw = request(API + "/app/installations/" + str(install_id), headers, None, 15, method="GET")
+    if status != 200:
+        raise RuntimeError("GitHub App installation check failed (HTTP {})".format(status))
+    try:
+        if json.loads(raw.decode())["account"]["login"].casefold() != repository.split("/", 1)[0].casefold():
+            raise PermissionError("installation owner does not match requested repository")
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        raise RuntimeError("GitHub App returned an invalid installation response")
+    status, raw = request(API + "/app/installations/" + str(install_id) + "/access_tokens", headers, body, 15, method="POST")
     if status != 201:
         raise RuntimeError("GitHub App token request failed (HTTP {})".format(status))
     try:
@@ -119,29 +134,47 @@ def ensure_lease(config, state_dir, task_id, repository, broker_start=None):
 
 
 def _start_broker(state):
-    pidfile = state / "broker" / "broker.pid"
+    broker = _private_dir(Path(state) / "broker")
+    lock = open(broker / "broker.lock", "a+")
     try:
-        pid = int(pidfile.read_text())
-        os.kill(pid, 0)
-        return
-    except (OSError, ValueError):
-        pass
-    command = [os.environ.get("PYTHON", "python3"), "-m", "mac_agent.auth", "serve", "--state-dir", str(state)]
-    subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close(); return
+    root = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    log = open(broker / "broker.log", "a")
+    os.chmod(broker / "broker.log", 0o600)
+    command = [sys.executable, "-m", "mac_agent.auth", "serve", "--state-dir", str(state)]
+    lock.close()
+    subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, start_new_session=True, close_fds=True)
+    log.close()
 
 
 def revoke_lease(config, state_dir, task_id):
-    if not TASK_RE.fullmatch(task_id): raise ValueError("invalid task id")
-    state = Path(state_dir).expanduser().absolute()
-    reg = state / "broker" / (task_id + ".json")
-    if reg.is_symlink(): raise ValueError("unsafe registry path")
-    try:
-        data = json.loads(reg.read_text())
-        tokenfile = Path(data["lease_dir"]) / "lease.json"
-        if tokenfile.is_file() and not tokenfile.is_symlink(): tokenfile.unlink()
-        reg.unlink()
-    except FileNotFoundError:
-        return
+    if not isinstance(task_id, str) or not TASK_RE.fullmatch(task_id):
+        raise ValueError("invalid task id")
+    state = _private_dir(state_dir)
+    failure = False
+    with _lease_lock(state, task_id):
+        reg = state / "broker" / (task_id + ".json")
+        tokenfile = state / "leases" / task_id / "lease.json"
+        if reg.is_symlink() or tokenfile.is_symlink():
+            raise ValueError("unsafe lease path")
+        try:
+            if tokenfile.is_file():
+                lease = json.loads(tokenfile.read_text())
+                status, _ = _request(API + "/installation/token", {"Accept":"application/vnd.github+json", "Authorization":"Bearer " + lease["token"], "X-GitHub-Api-Version":"2022-11-28"}, None, 15, method="DELETE")
+                failure = status not in (204, 401)
+        except Exception:
+            failure = True
+        finally:
+            for path in (reg, tokenfile, state / "broker" / (task_id + ".error.json")):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+    if failure:
+        raise RuntimeError("Local lease removed; remote token revocation could not be verified")
 
 
 def lease_status(state_dir, task_id):
@@ -151,40 +184,94 @@ def lease_status(state_dir, task_id):
     try:
         data = json.loads(path.read_text())
         exp = _utc(data["expires_at"])
-        return {"status": "active" if exp > time.time() else "expired", "expires_at": data["expires_at"], "repository": data.get("repository")}
+        result = {"status": "active" if exp > time.time() else "expired", "expires_at": data["expires_at"], "repository": data.get("repository")}
+        error = Path(state_dir).expanduser().absolute() / "broker" / (task_id + ".error.json")
+        if error.is_file() and not error.is_symlink():
+            result["renewal_error"] = json.loads(error.read_text()).get("renewal_error", "unknown")
+        return result
     except (OSError, ValueError, KeyError, TypeError):
         return {"status": "missing"}
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _lease_lock(state, task_id):
+    broker = _private_dir(Path(state) / "broker")
+    path = broker / (task_id + ".lock")
+    if path.is_symlink():
+        raise ValueError("Unsafe lease lock")
+    with open(path, "a+") as stream:
+        os.chmod(path, 0o600)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def _refresh_once(state_dir):
+    state = _private_dir(state_dir)
+    broker = _private_dir(state / "broker")
+    active = 0
+    for reg in broker.glob("[a-f0-9]" * 12 + ".json"):
+        task_id = reg.stem
+        with _lease_lock(state, task_id):
+            if not reg.exists() or reg.is_symlink():
+                continue
+            active += 1
+            error = broker / (task_id + ".error.json")
+            try:
+                item = json.loads(reg.read_text())
+                lease_dir = state / "leases" / task_id
+                if item["task_id"] != task_id or item["lease_dir"] != str(lease_dir) or lease_dir.is_symlink():
+                    raise ValueError("Lease identity mismatch")
+                lease = lease_dir / "lease.json"
+                if lease.is_symlink():
+                    raise ValueError("Unsafe lease file")
+                current = json.loads(lease.read_text())
+                if current["repository"] != item["repository"]:
+                    raise ValueError("Lease scope mismatch")
+                if _utc(current["expires_at"]) > time.time() + 180:
+                    continue
+                cfg = {"app_id": item["app_id"], "installation_id": item["installation_id"], "private_key_path": item["key_path"]}
+                fresh = mint_installation_token(cfg, item["repository"])
+                _atomic_json(lease, fresh)
+                if error.exists():
+                    error.unlink()
+            except Exception as exc:
+                _atomic_json(error, {"renewal_error": type(exc).__name__, "at": datetime.now(timezone.utc).isoformat()})
+    return active
 
 
 def _serve(state_dir):
     state = _private_dir(state_dir)
     broker = _private_dir(state / "broker")
     pid_path = broker / "broker.pid"
-    _atomic_json(pid_path, {"pid": os.getpid()})
-    stop = False
-    def halt(*_):
-        nonlocal stop
-        stop = True
-    signal.signal(signal.SIGTERM, halt); signal.signal(signal.SIGINT, halt)
-    while not stop:
-        for reg in broker.glob("[a-f0-9]" * 12 + ".json"):
+    with open(broker / "broker.lock", "a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        os.chmod(broker / "broker.lock", 0o600)
+        _atomic_json(pid_path, {"pid": os.getpid()})
+        stop = False
+        def halt(*_):
+            nonlocal stop
+            stop = True
+        signal.signal(signal.SIGTERM, halt)
+        signal.signal(signal.SIGINT, halt)
+        try:
+            while not stop:
+                if not _refresh_once(state):
+                    break
+                for _ in range(15):
+                    if stop:
+                        break
+                    time.sleep(1)
+        finally:
             try:
-                if reg.is_symlink(): continue
-                item = json.loads(reg.read_text())
-                lease_dir = Path(item["lease_dir"])
-                lease = lease_dir / "lease.json"
-                current = json.loads(lease.read_text())
-                if current["repository"] != item["repository"] or _utc(current["expires_at"]) > time.time() + 180:
-                    continue
-                cfg = {"app_id": item["app_id"], "installation_id": item["installation_id"], "private_key_path": item["key_path"]}
-                fresh = mint_installation_token(cfg, item["repository"])
-                _atomic_json(lease, fresh)
-            except Exception:
-                # Keep daemon alive; status exposes expiry rather than secret-bearing errors.
-                continue
-        time.sleep(15)
-    try: pid_path.unlink()
-    except OSError: pass
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main():

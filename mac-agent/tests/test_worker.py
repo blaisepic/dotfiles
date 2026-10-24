@@ -35,7 +35,8 @@ class WorkerTests(unittest.TestCase):
         self.assertIn('--read-only', args)
         self.assertIn('--tmpfs', args)
         self.assertIn('--read-only', args)
-        self.assertFalse(any('docker.sock' in arg or '/Users/' in arg for arg in args))
+        self.assertFalse(any('docker.sock' in arg for arg in args))
+        self.assertFalse(any(arg.startswith(str(Path.home()) + ':/') for arg in args))
         self.assertIn('mac-agent.task_id=012345abcdef', args)
 
     def test_inspect_refuses_unowned_container(self):
@@ -84,6 +85,16 @@ class WorkerTests(unittest.TestCase):
             run.return_value.stdout = json.dumps([{'Id':'cid','State':{'Status':'exited','ExitCode':137},
                 'Config':{'Labels':{'mac-agent.task_id':self.task['id'],'mac-agent.managed':'true'}}}])
             self.assertEqual(self.worker.inspect(self.task)['status'], 'stopped')
+
+    def test_sessions_are_separate_for_each_task_and_model_is_passed(self):
+        self.config['worker']['model'] = 'gpt-6-luna'
+        with patch('mac_agent.worker.subprocess.run') as run:
+            run.return_value.stdout = 'container-id'
+            self.worker.start(self.task)
+        args = run.call_args.args[0]
+        self.assertIn('mac-agent-012345abcdef-sessions:/home/worker/.codex/sessions:rw', args)
+        self.assertIn('CODEX_SQLITE_HOME=/home/worker/state', args)
+        self.assertIn('MAC_AGENT_MODEL=gpt-6-luna', args)
 
     def test_build_passes_host_uid_gid_and_configured_codex_version(self):
         with patch('mac_agent.worker.subprocess.run') as run:

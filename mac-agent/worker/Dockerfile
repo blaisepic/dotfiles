@@ -7,8 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git gh python3 
  && (getent group ${WORKER_GID} >/dev/null || groupadd --gid ${WORKER_GID} worker) \
  && (test "${WORKER_UID}" != 0 || (echo 'WORKER_UID must be nonzero' >&2; exit 1)) \
  && useradd --create-home --uid ${WORKER_UID} --gid ${WORKER_GID} --shell /bin/sh worker \
- && mkdir -p /run/mac-agent /workspace /home/worker/.codex \
+ && mkdir -p /run/mac-agent /workspace /home/worker/.codex/sessions /home/worker/state \
  && chown -R ${WORKER_UID}:${WORKER_GID} /home/worker /workspace
+COPY --chmod=0755 launch.py /usr/local/lib/mac-agent/launch.py
 COPY --chmod=0755 entrypoint /usr/local/bin/mac-agent-entrypoint
 COPY --chmod=0755 git-credential-mac-agent /usr/local/bin/git-credential-mac-agent
 COPY --chmod=0755 gh /usr/local/bin/gh
