@@ -26,5 +26,21 @@ class CliTests(unittest.TestCase):
         service.create_task.assert_called_once_with(cfg, 'dotfiles', 'fix $(not-a-shell)', publish=False)
         self.assertEqual(json.loads(out.getvalue())['id'], 'abcdef123456')
 
+    def test_start_uses_worker_and_saves_running_state(self):
+        cfg = {'state_dir': '/state'}
+        service, worker = mock.Mock(), mock.Mock()
+        task = {'id': 'abcdef123456', 'repository': 'blaisepic/dotfiles', 'status': 'ready', 'publish': False, 'resume_count': 0}
+        service.get_task.return_value = task
+        worker.start.return_value = {'status': 'running', 'container_id': 'container-id'}
+        with mock.patch.object(cli, '_load_config', return_value=cfg), \
+             mock.patch.object(cli, '_task_service', return_value=service), \
+             mock.patch.object(cli, '_worker', return_value=worker, create=True), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = cli.main(['--json', 'start', task['id']])
+        self.assertEqual(result, 0)
+        worker.start.assert_called_once_with(task, lease_dir=None, resume=False)
+        self.assertEqual(task['status'], 'running')
+        service.save_task.assert_called_once_with(cfg, task)
+
 if __name__ == '__main__':
     unittest.main()
