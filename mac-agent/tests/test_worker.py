@@ -31,7 +31,9 @@ class WorkerTests(unittest.TestCase):
             result = self.worker.start(self.task)
         args = run.call_args.args[0]
         self.assertEqual(result['container_id'], 'container-id')
-        self.assertIn('--network=none', args)
+        self.assertNotIn('--network=none', args)
+        self.assertIn('--read-only', args)
+        self.assertIn('--tmpfs', args)
         self.assertIn('--read-only', args)
         self.assertFalse(any('docker.sock' in arg or '/Users/' in arg for arg in args))
         self.assertIn('mac-agent.task_id=012345abcdef', args)
@@ -61,6 +63,35 @@ class WorkerTests(unittest.TestCase):
         record.write_text(json.dumps({'token': 'rotated', 'expires_at': '2099-01-01T00:00:00Z',
                                       'repository': 'acme/widgets'}))
         self.assertIn('password=rotated', invoke('acme/widgets').stdout)
+
+    def test_resume_restarts_existing_container_instead_of_creating_name_again(self):
+        with patch('mac_agent.worker.subprocess.run') as run:
+            run.side_effect = [type('R', (), {'stdout':'container-id\n'})(), type('R', (), {'stdout':json.dumps([{'Id':'cid','Config':{'Labels':{'mac-agent.task_id':self.task['id'],'mac-agent.managed':'true'}}}])})()]
+            self.worker.start(self.task, resume=True)
+        args = run.call_args_list[0].args[0]
+        self.assertEqual(args, ['docker', 'start', self.task['container_name']])
+
+    def test_import_auth_targets_codex_volume_and_correct_path(self):
+        auth = self.root_path/'auth.json'; auth.write_text('{}')
+        with patch('mac_agent.worker.subprocess.run') as run:
+            self.worker.import_codex_auth(auth)
+        args = run.call_args.args[0]
+        self.assertIn('codex-auth:/home/worker/.codex', args)
+        self.assertNotIn('codex-auth:/auth', args)
+
+    def test_inspect_stopped_is_not_failed(self):
+        with patch('mac_agent.worker.subprocess.run') as run:
+            run.return_value.stdout = json.dumps([{'Id':'cid','State':{'Status':'exited','ExitCode':137},
+                'Config':{'Labels':{'mac-agent.task_id':self.task['id'],'mac-agent.managed':'true'}}}])
+            self.assertEqual(self.worker.inspect(self.task)['status'], 'stopped')
+
+    def test_build_passes_host_uid_gid_and_configured_codex_version(self):
+        with patch('mac_agent.worker.subprocess.run') as run:
+            self.worker.build()
+        args = run.call_args.args[0]
+        self.assertIn('WORKER_UID='+str(os.getuid()), args)
+        self.assertIn('WORKER_GID='+str(os.getgid()), args)
+        self.assertIn('CODEX_VERSION=0.163.0', args)
 
 
 if __name__ == '__main__':
