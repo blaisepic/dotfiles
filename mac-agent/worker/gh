@@ -1,0 +1,20 @@
+#!/bin/sh
+# Executes the real gh without recursively resolving this wrapper.
+set -eu
+lease=${MAC_AGENT_LEASE_FILE:-/run/mac-agent/github/lease.json}
+repository=${MAC_AGENT_REPOSITORY:-}
+token=$(python3 - "$lease" "$repository" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+try:
+ d=json.load(open(sys.argv[1])); exp=datetime.fromisoformat(d['expires_at'].replace('Z','+00:00'))
+ if d.get('repository')==sys.argv[2] and exp>datetime.now(timezone.utc): print(d['token'],end='')
+except Exception: pass
+PY
+)
+if [ -z "$token" ]; then echo 'no valid GitHub lease' >&2; exit 1; fi
+unset GH_TOKEN GITHUB_TOKEN
+export GH_TOKEN="$token" GITHUB_TOKEN="$token"
+real=/usr/bin/gh
+[ -x "$real" ] || real=/usr/local/bin/gh
+exec "$real" "$@"
