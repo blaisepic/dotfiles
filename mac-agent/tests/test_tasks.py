@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from mac_agent.tasks import create_task, get_task, list_tasks, save_task
 
@@ -77,6 +78,28 @@ class TaskStorageTests(unittest.TestCase):
             create_task(self.config, '../fixture', 'No')
         with self.assertRaises(ValueError):
             get_task(self.config, '../escape')
+
+    def test_failed_checkout_removes_only_new_task_directory(self):
+        state_tasks = self.root / 'state' / 'tasks'
+        state_tasks.mkdir(parents=True)
+        existing = state_tasks / 'abcdef123456'
+        existing.mkdir()
+        sentinel = existing / 'keep.txt'
+        sentinel.write_text('existing task data')
+
+        tokens = iter(['abcdef123456', '0123456789ab'])
+        original_run = subprocess.run
+        def fail_checkout(args, **kwargs):
+            if 'checkout' in args:
+                raise subprocess.CalledProcessError(1, args)
+            return original_run(args, **kwargs)
+        with mock.patch('mac_agent.tasks.secrets.token_hex', side_effect=lambda _: next(tokens)):
+            with mock.patch('mac_agent.tasks.subprocess.run', side_effect=fail_checkout):
+                with self.assertRaises(ValueError):
+                    create_task(self.config, 'fixture', 'fail preparation', publish=False)
+
+        self.assertFalse((state_tasks / '0123456789ab').exists())
+        self.assertEqual(sentinel.read_text(), 'existing task data')
 
     def test_rejects_symlinked_task_directory(self):
         state_tasks = self.root / 'state' / 'tasks'

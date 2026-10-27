@@ -1,5 +1,7 @@
 """Terminal interface; runtime imports are lazy so help needs no configuration."""
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -56,6 +58,80 @@ def _safe_error(exc):
     return 'operation failed; details were withheld for safety'
 
 
+@contextlib.contextmanager
+def _task_lock(config, task_id):
+    if not isinstance(task_id, str) or len(task_id) != 12 or any(c not in '0123456789abcdef' for c in task_id):
+        raise ValueError('invalid task id')
+    from .auth import _private_dir
+    root = _private_dir(config['state_dir'])
+    locks = _private_dir(root / 'locks')
+    fd = os.open(locks / (task_id + '.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _complete_task(config, task, worker):
+    if task.get('completion_recorded') or task.get('status') not in ('succeeded', 'failed', 'blocked'):
+        return
+    try:
+        if task.get('publish') and task['status'] == 'succeeded':
+            from .publication import verify_pull_request
+            try:
+                lease = Path(config['state_dir']) / 'leases' / task['id'] / 'lease.json'
+                token = json.loads(lease.read_text()).get('token') if lease.is_file() and not lease.is_symlink() else None
+                from .tasks import _git_env
+                head = subprocess.run(
+                    ['git', '-c', 'core.hooksPath=' + os.devnull, '-C', task['workspace'], 'rev-parse', 'HEAD'],
+                    env=_git_env(), check=True, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+                ).stdout.strip()
+                task['worker_commit'] = head
+                task.update(verify_pull_request(task['repository'], task['branch'], task['base_branch'],
+                                              token=token, expected_commit=head))
+            except Exception:
+                task.update(status='blocked', publication_verified=False, error='Worker exited but its PR could not be independently verified')
+        if task.get('task_dir'):
+            try:
+                directory = Path(task['task_dir']) / 'logs'
+                directory.mkdir(mode=0o700, exist_ok=True)
+                log = directory / 'worker.log'
+                log.write_text(worker.logs(task, tail=2000))
+                log.chmod(0o600)
+            except Exception:
+                task['log_warning'] = 'Worker log could not be archived'
+    finally:
+        if task.get('publish'):
+            try:
+                _auth_service().revoke_lease(config, config['state_dir'], task['id'])
+            except Exception:
+                task['credential_warning'] = 'Credential cleanup could not be fully verified'
+    task['completion_recorded'] = True
+
+
+def _observe(config, task, worker, service):
+    with _task_lock(config, task['id']):
+        latest = dict(service.get_task(config, task['id']))
+        task.clear()
+        task.update(latest)
+        if task.get('completion_recorded') or task.get('status') == 'ready':
+            return task
+        previous = task.get('status')
+        observed = worker.inspect(task)
+        if observed['status'] == 'missing':
+            if previous == 'running':
+                task.update(status='blocked', error='Worker container missing; workspace is preserved')
+        else:
+            task.update(observed)
+            if previous == 'stopped' and observed['status'] != 'running':
+                task['status'] = 'stopped'
+        _complete_task(config, task, worker)
+        service.save_task(config, task)
+        return task
+
+
 def _run(args):
     config = _load_config(args.config)
     service = _task_service()
@@ -77,43 +153,50 @@ def _run(args):
     task = service.get_task(config, args.id)
     worker = _worker(config)
     if command == 'status':
-        observed = worker.inspect(task)
-        if observed['status'] != 'missing':
-            task.update(observed)
-            # Preserve an explicitly requested stop despite Docker's common 143 exit.
-            if task.get('status') == 'stopped' and task.get('error') == 'stopped by user': task['status'] = 'stopped'
-            service.save_task(config, task)
-        _emit(task, args.json); return 0
+        _emit(_observe(config, task, worker, service), args.json); return 0
     if command == 'logs':
         print(worker.logs(task, tail=args.tail), end=''); return 0
     if command == 'stop':
-        worker.stop(task)
-        task.update(status='stopped', error='stopped by user')
-        service.save_task(config, task)
-        if task.get('publish'): _auth_service().revoke_lease(config, config['state_dir'], task['id'])
+        with _task_lock(config, args.id):
+            task = service.get_task(config, args.id)
+            worker.stop(task)
+            task.update(status='stopped', error='stopped by user')
+            if task.get('publish'):
+                try: _auth_service().revoke_lease(config, config['state_dir'], task['id'])
+                except Exception: task['credential_warning'] = 'Local lease removed; remote revocation not verified'
+            service.save_task(config, task)
         _emit(task, args.json); return 0
     if command in ('resume', 'start'):
-        allowed = ('stopped', 'failed', 'blocked') if command == 'resume' else ('ready',)
-        if task['status'] not in allowed: raise ValueError('task status does not allow this operation')
-        lease = _auth_service().ensure_lease(config, config['state_dir'], task['id'], task['repository']) if task.get('publish') else None
-        try:
-            result = worker.start(task, lease_dir=lease, resume=(command == 'resume'))
-        except Exception as exc:
-            task.update(status='blocked', error='worker start failed')
-            service.save_task(config, task)
-            if task.get('publish'): _auth_service().revoke_lease(config, config['state_dir'], task['id'])
-            raise RuntimeError('worker start failed') from exc
-        task.update(result)
-        if command == 'resume': task['resume_count'] += 1
-        task.update(status='running', error=None)
-        service.save_task(config, task); _emit(task, args.json); return 0
+        with _task_lock(config, args.id):
+            task = service.get_task(config, args.id)
+            allowed = ('stopped', 'failed', 'blocked') if command == 'resume' else ('ready',)
+            if task['status'] not in allowed: raise ValueError('task status does not allow this operation')
+            try:
+                lease = _auth_service().ensure_lease(config, config['state_dir'], task['id'], task['repository']) if task.get('publish') else None
+                result = worker.start(task, lease_dir=lease, resume=(command == 'resume'))
+            except Exception as exc:
+                task.update(status='blocked', error='worker start failed')
+                if task.get('publish'):
+                    try: _auth_service().revoke_lease(config, config['state_dir'], task['id'])
+                    except Exception: task['credential_warning'] = 'Local lease removed; remote revocation not verified'
+                service.save_task(config, task)
+                raise RuntimeError('worker start failed') from exc
+            task.update(result)
+            if command == 'resume': task['resume_count'] += 1
+            task.pop('completion_recorded', None)
+            task.pop('publication_verified', None)
+            task.update(status='running', error=None)
+            service.save_task(config, task); _emit(task, args.json); return 0
     if command == 'wait':
         if args.timeout < 0 or args.interval <= 0: raise ValueError('timeout must be nonnegative and interval positive')
         deadline = time.monotonic() + args.timeout
         while True:
-            observed = worker.inspect(task); task.update(observed)
-            if observed['status'] in ('succeeded', 'failed', 'blocked', 'stopped'):
-                service.save_task(config, task); _emit(task, args.json)
+            _observe(config, task, worker, service)
+            if task['status'] == 'ready':
+                _emit({'id': task['id'], 'status': 'ready', 'error': 'Task has not been started'}, args.json)
+                return 1
+            if task['status'] in ('succeeded', 'failed', 'blocked', 'stopped'):
+                _emit(task, args.json)
                 return 0 if task['status'] == 'succeeded' else 1
             if time.monotonic() >= deadline:
                 _emit({'id': task['id'], 'status': 'timeout'}, args.json); return 124

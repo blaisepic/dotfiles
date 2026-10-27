@@ -10,12 +10,14 @@ import signal
 import subprocess
 import tempfile
 import time
+import stat
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 API = "https://api.github.com"
+OPENSSL = "/usr/bin/openssl"
 TASK_RE = re.compile(r"^[a-f0-9]{12}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -45,7 +47,7 @@ def _sign(app_id, key_path, now):
     header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(json.dumps({"iat": int(now) - 30, "exp": int(now) + 540, "iss": str(app_id)}, separators=(",", ":")).encode()).rstrip(b"=").decode()
     message = (header + "." + payload).encode()
-    proc = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key_path)], input=message, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=True)
+    proc = subprocess.run([OPENSSL, "dgst", "-sha256", "-sign", str(key_path)], input=message, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=True)
     return header + "." + payload + "." + base64.urlsafe_b64encode(proc.stdout).rstrip(b"=").decode()
 
 
@@ -66,18 +68,22 @@ def mint_installation_token(app_config, repository, http_request=None, now=None,
     if not str(app_id).isdigit() or not str(install_id).isdigit() or not key.is_absolute() or key.is_symlink():
         raise ValueError("invalid GitHub App configuration")
     st = os.stat(str(key), follow_symlinks=False)
-    if st.st_mode & 0o077 or st.st_uid != os.getuid():
+    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
         raise PermissionError("GitHub App key must be private")
     now = time.time() if now is None else now
     jwt = (signer or _sign)(app_id, key, now)
     body = json.dumps({"repositories": [repository.split("/", 1)[1]], "permissions": {"contents": "write", "pull_requests": "write"}}, separators=(",", ":")).encode()
     request = http_request or _request
     headers = {"Accept": "application/vnd.github+json", "Authorization": "Bearer " + jwt, "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"}
-    status, raw = request(API + "/app/installations/" + str(install_id), headers, None, 15, method="GET")
+    owner, repo = repository.split("/", 1)
+    status, raw = request(API + "/repos/" + owner + "/" + repo + "/installation", headers, None, 15, method="GET")
     if status != 200:
         raise RuntimeError("GitHub App installation check failed (HTTP {})".format(status))
     try:
-        if json.loads(raw.decode())["account"]["login"].casefold() != repository.split("/", 1)[0].casefold():
+        install = json.loads(raw.decode())
+        if str(install["id"]) != str(install_id):
+            raise PermissionError("installation id does not match configured installation")
+        if install["account"]["login"].casefold() != repository.split("/", 1)[0].casefold():
             raise PermissionError("installation owner does not match requested repository")
     except (KeyError, TypeError, ValueError, UnicodeError):
         raise RuntimeError("GitHub App returned an invalid installation response")
@@ -120,16 +126,39 @@ def ensure_lease(config, state_dir, task_id, repository, broker_start=None):
     if not TASK_RE.fullmatch(task_id): raise ValueError("invalid task id")
     _repo_allowed(config, repository)
     state = _private_dir(state_dir)
+    registry = _private_dir(state / "broker")
     leases = _private_dir(state / "leases")
     task_dir = _private_dir(leases / task_id)
     cfg = config.get("github_app", {})
     key = Path(cfg.get("private_key_path", "")).expanduser().absolute()
     if key.is_symlink(): raise ValueError("unsafe App key path")
-    result = mint_installation_token(cfg, repository)
-    _atomic_json(task_dir / "lease.json", {"token": result["token"], "expires_at": result["expires_at"], "repository": repository})
-    registry = _private_dir(state / "broker")
-    _atomic_json(registry / (task_id + ".json"), {"task_id": task_id, "repository": repository, "config_path": config.get("_config_path"), "key_path": str(key), "app_id": cfg.get("app_id"), "installation_id": cfg.get("installation_id"), "lease_dir": str(task_dir)})
-    (broker_start or _start_broker)(state)
+    tokenfile = task_dir / "lease.json"
+    result = None
+    try:
+        with _lease_lock(state, task_id):
+            result = mint_installation_token(cfg, repository)
+            _atomic_json(tokenfile, {"token": result["token"], "expires_at": result["expires_at"], "repository": repository})
+            _atomic_json(registry / (task_id + ".json"), {"task_id": task_id, "repository": repository, "config_path": config.get("_config_path"), "key_path": str(key), "app_id": cfg.get("app_id"), "installation_id": cfg.get("installation_id"), "lease_dir": str(task_dir)})
+            (broker_start or _start_broker)(state)
+    except Exception:
+        revoke_ok = False
+        try:
+            if result is None: raise RuntimeError("token was not minted")
+            revoke_status, _ = _request(API + "/installation/token", {"Accept":"application/vnd.github+json", "Authorization":"Bearer " + result["token"], "X-GitHub-Api-Version":"2022-11-28"}, None, 15, method="DELETE")
+            revoke_ok = revoke_status in (204, 401)
+        except Exception:
+            pass
+        if not revoke_ok:
+            try:
+                _atomic_json(registry / (task_id + "." + os.urandom(6).hex() + ".revoke.json"), {"task_id": task_id, "token": result["token"], "expires_at": result["expires_at"]})
+            except Exception:
+                raise RuntimeError("broker start failed; revocation could not be queued") from None
+            try: _start_broker(state)
+            except Exception: pass
+        for path in (registry / (task_id + ".json"), tokenfile):
+            try: path.unlink()
+            except FileNotFoundError: pass
+        raise RuntimeError("broker start failed; local lease rolled back") from None
     return task_dir
 
 
@@ -168,12 +197,20 @@ def revoke_lease(config, state_dir, task_id):
         except Exception:
             failure = True
         finally:
+            if failure and tokenfile.is_file() and not tokenfile.is_symlink():
+                try:
+                    rec = json.loads(tokenfile.read_text())
+                    _atomic_json(state / "broker" / (task_id + "." + os.urandom(6).hex() + ".revoke.json"), {"token": rec["token"], "expires_at": rec["expires_at"]})
+                except Exception:
+                    pass
             for path in (reg, tokenfile, state / "broker" / (task_id + ".error.json")):
                 try:
                     path.unlink()
                 except FileNotFoundError:
                     pass
     if failure:
+        try: _start_broker(state)
+        except Exception: pass
         raise RuntimeError("Local lease removed; remote token revocation could not be verified")
 
 
@@ -211,6 +248,16 @@ def _lease_lock(state, task_id):
 def _refresh_once(state_dir):
     state = _private_dir(state_dir)
     broker = _private_dir(state / "broker")
+    for pending in broker.glob("[a-f0-9]" * 12 + "*.revoke.json"):
+        task_id = pending.name[:12]
+        with _lease_lock(state, task_id):
+            if pending.is_symlink(): continue
+            try:
+                record = json.loads(pending.read_text())
+                if _utc(record["expires_at"]) <= time.time(): pending.unlink(); continue
+                status, _ = _request(API + "/installation/token", {"Accept":"application/vnd.github+json", "Authorization":"Bearer " + record["token"], "X-GitHub-Api-Version":"2022-11-28"}, None, 15, method="DELETE")
+                if status in (204, 401): pending.unlink()
+            except Exception: pass
     active = 0
     for reg in broker.glob("[a-f0-9]" * 12 + ".json"):
         task_id = reg.stem
@@ -261,8 +308,7 @@ def _serve(state_dir):
         signal.signal(signal.SIGINT, halt)
         try:
             while not stop:
-                if not _refresh_once(state):
-                    break
+                _refresh_once(state)
                 for _ in range(15):
                     if stop:
                         break

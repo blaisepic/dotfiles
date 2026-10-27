@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import tempfile
 
@@ -166,20 +167,30 @@ def create_task(config, repo_alias, prompt, publish=True):
         raise ValueError('invalid base branch')
 
     tasks_root = _tasks_root(config)
-    task_id = secrets.token_hex(6)
-    directory = tasks_root / task_id
-    directory.mkdir(mode=0o700)
+    for _ in range(5):
+        task_id = secrets.token_hex(6)
+        directory = tasks_root / task_id
+        try:
+            directory.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise ValueError('could not allocate a unique task id')
     workspace = directory / 'workspace'
     try:
         _git(['clone', '--no-local', '--no-checkout', '--', source, str(workspace)])
         _git(['-C', str(workspace), 'checkout', '--quiet', branch_name])
-        base_commit = subprocess.check_output(['git', '-C', str(workspace), 'rev-parse', 'HEAD'],
-                                              env=_git_env(), text=True, stderr=subprocess.PIPE).strip()
+        result = subprocess.run(['git', '-c', 'core.hooksPath=' + os.devnull, '-C', str(workspace), 'rev-parse', 'HEAD'],
+                                env=_git_env(), check=True, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        base_commit = result.stdout.strip()
         _git(['-C', str(workspace), 'switch', '--quiet', '-c', 'agent/' + task_id])
         _git(['-C', str(workspace), 'config', 'user.name', 'Mac Agent'])
         _git(['-C', str(workspace), 'config', 'user.email', 'mac-agent@users.noreply.github.com'])
         _git(['-C', str(workspace), 'config', 'commit.gpgsign', 'false'])
     except (subprocess.CalledProcessError, OSError) as exc:
+        shutil.rmtree(directory)
         raise ValueError('failed to prepare task repository') from exc
 
     now = _utc_now()
