@@ -130,10 +130,19 @@ def _git_env():
     return env
 
 
-def _git(args, cwd=None):
+def _git(args, cwd=None, env=None):
     subprocess.run(['git', '-c', 'core.hooksPath=' + os.devnull] + args,
-                   cwd=cwd, env=_git_env(), check=True, stdin=subprocess.DEVNULL,
+                   cwd=cwd, env=_git_env() if env is None else env, check=True, stdin=subprocess.DEVNULL,
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _github_auth_failure(exc):
+    error = exc.stderr or b''
+    if isinstance(error, str):
+        error = error.encode()
+    text = error.decode('utf-8', 'replace').lower()
+    return ('github.com' in text and any(s in text for s in
+            ('could not read username', 'authentication failed', 'could not read password')))
 
 
 def create_task(config, repo_alias, prompt, publish=True):
@@ -178,8 +187,25 @@ def create_task(config, repo_alias, prompt, publish=True):
     else:
         raise ValueError('could not allocate a unique task id')
     workspace = directory / 'workspace'
+    lease_ready = False
     try:
-        _git(['clone', '--no-local', '--no-checkout', '--', source, str(workspace)])
+        clone_args = ['clone', '--no-local', '--no-checkout', '--', source, str(workspace)]
+        try:
+            _git(clone_args)
+        except subprocess.CalledProcessError as exc:
+            if not (source.startswith('https://github.com/') and _github_auth_failure(exc)):
+                raise
+            from . import auth
+            lease_dir = auth.ensure_lease(config, config['state_dir'], task_id, repository)
+            lease_ready = True
+            shutil.rmtree(workspace, ignore_errors=True)
+            helper = Path(__file__).with_name('clone_askpass.py')
+            retry_env = _git_env()
+            retry_env.update({'GIT_ASKPASS': str(helper), 'GIT_ASKPASS_REQUIRE': 'force',
+                              'MAC_AGENT_CLONE_LEASE': str(Path(lease_dir) / 'lease.json'),
+                              'MAC_AGENT_CLONE_REPOSITORY': repository,
+                              'PYTHONPATH': str(Path(__file__).resolve().parents[1]) + os.pathsep + retry_env.get('PYTHONPATH', '')})
+            _git(clone_args, env=retry_env)
         _git(['-C', str(workspace), 'checkout', '--quiet', branch_name])
         result = subprocess.run(['git', '-c', 'core.hooksPath=' + os.devnull, '-C', str(workspace), 'rev-parse', 'HEAD'],
                                 env=_git_env(), check=True, stdin=subprocess.DEVNULL,
@@ -189,9 +215,17 @@ def create_task(config, repo_alias, prompt, publish=True):
         _git(['-C', str(workspace), 'config', 'user.name', 'Mac Agent'])
         _git(['-C', str(workspace), 'config', 'user.email', 'mac-agent@users.noreply.github.com'])
         _git(['-C', str(workspace), 'config', 'commit.gpgsign', 'false'])
-    except (subprocess.CalledProcessError, OSError) as exc:
+    except Exception as exc:
         shutil.rmtree(directory)
         raise ValueError('failed to prepare task repository') from exc
+    finally:
+        if lease_ready:
+            from . import auth
+            try:
+                auth.revoke_lease(config, config['state_dir'], task_id)
+            except Exception:
+                shutil.rmtree(directory, ignore_errors=True)
+                raise
 
     now = _utc_now()
     brief_path = directory / 'brief.txt'

@@ -79,6 +79,91 @@ class TaskStorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_task(self.config, '../escape')
 
+    def test_private_github_auth_failure_retries_with_scoped_host_askpass_lease(self):
+        self.config['repositories']['fixture'].update(
+            github='owner/private', source='https://github.com/owner/private.git')
+        import mac_agent.auth as auth
+        import mac_agent.tasks as tasks
+        original_git = tasks._git
+        calls = []
+        def git(args, cwd=None, env=None):
+            calls.append((args, env))
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(
+                    128, args, stderr=b"fatal: could not read Username for 'https://github.com': terminal prompts disabled")
+            if args[0] == 'clone' and env is not None:
+                args = list(args)
+                args[-2] = str(self.repo)
+            return original_git(args, cwd=cwd, env=env)
+        with mock.patch('mac_agent.auth.ensure_lease') as ensure, \
+                mock.patch('mac_agent.auth.revoke_lease') as revoke, \
+                mock.patch('mac_agent.tasks._git', side_effect=git):
+            ensure.return_value = self.root / 'lease'
+            task = create_task(self.config, 'fixture', 'private prep', publish=False)
+        self.assertEqual(ensure.call_args.args[2], task['id'])
+        self.assertEqual(ensure.call_args.args[3], 'owner/private')
+        self.assertEqual(revoke.call_args.args[2], task['id'])
+        clone_calls = [entry for entry in calls if entry[0][0] == 'clone']
+        self.assertEqual(len(clone_calls), 2)
+        self.assertIsNotNone(clone_calls[1][1].get('GIT_ASKPASS'))
+        self.assertNotIn('token', repr(clone_calls[1][1]).lower())
+        self.assertTrue((Path(task['workspace']) / 'README').exists())
+
+    def test_private_clone_lease_setup_failure_removes_partial_task(self):
+        self.config['repositories']['fixture'].update(
+            github='owner/private', source='https://github.com/owner/private.git')
+        failure = subprocess.CalledProcessError(128, ['git', 'clone'],
+            stderr=b"could not read Username for https://github.com")
+        with mock.patch('mac_agent.tasks._git', side_effect=failure), \
+             mock.patch('mac_agent.auth.ensure_lease', side_effect=RuntimeError('auth unavailable')):
+            with self.assertRaises(ValueError):
+                create_task(self.config, 'fixture', 'private prep', publish=False)
+        self.assertEqual(list((self.root / 'state' / 'tasks').iterdir()), [])
+
+    def test_private_clone_retry_failure_revokes_preparation_lease(self):
+        self.config['repositories']['fixture'].update(
+            github='owner/private', source='https://github.com/owner/private.git')
+        import mac_agent.tasks as tasks
+        attempts = 0
+        def fail_clones(args, cwd=None, env=None):
+            nonlocal attempts
+            if args[0] == 'clone':
+                attempts += 1
+                raise subprocess.CalledProcessError(128, args, stderr=b"could not read Username for https://github.com")
+            return subprocess.CompletedProcess(args, 0)
+        with mock.patch('mac_agent.auth.ensure_lease', return_value=self.root / 'lease') as ensure, \
+                mock.patch('mac_agent.auth.revoke_lease') as revoke, \
+                mock.patch('mac_agent.tasks._git', side_effect=fail_clones):
+            with self.assertRaises(ValueError):
+                create_task(self.config, 'fixture', 'private prep', publish=False)
+        self.assertEqual(attempts, 2)
+        revoke.assert_called_once_with(self.config, self.config['state_dir'], ensure.call_args.args[2])
+
+    def test_clone_askpass_accepts_git_password_prompt_with_username(self):
+        from mac_agent import clone_askpass
+        import contextlib
+        import io
+        lease = self.root / 'clone-lease.json'
+        lease.write_text(json.dumps({'repository': 'owner/private', 'token': 'test-only-token',
+                                     'expires_at': '2099-01-01T00:00:00Z'}))
+        lease.chmod(0o600)
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {'MAC_AGENT_CLONE_LEASE': str(lease),
+                                         'MAC_AGENT_CLONE_REPOSITORY': 'owner/private'}), \
+             mock.patch('sys.argv', ['askpass', "Password for 'https://x-access-token@github.com':"]), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(clone_askpass.main(), 0)
+        self.assertEqual(output.getvalue(), 'test-only-token\n')
+
+    def test_clone_askpass_rejects_wrong_host_and_noncredential_prompts(self):
+        from mac_agent import clone_askpass
+        with mock.patch.dict(os.environ, {'MAC_AGENT_CLONE_LEASE': str(self.root / 'missing'),
+                                         'MAC_AGENT_CLONE_REPOSITORY': 'owner/private'}):
+            for prompt in ('Username for https://evil.example:', 'Enter passphrase for key'):
+                with mock.patch('sys.argv', ['askpass', prompt]), mock.patch('builtins.print') as output:
+                    self.assertEqual(clone_askpass.main(), 1)
+                    output.assert_not_called()
+
     def test_failed_checkout_removes_only_new_task_directory(self):
         state_tasks = self.root / 'state' / 'tasks'
         state_tasks.mkdir(parents=True)
